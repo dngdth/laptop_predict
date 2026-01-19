@@ -6,13 +6,13 @@ import joblib
 import os
 
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor  # theo notebook bạn
 from xgboost import XGBRegressor
-from xgboost.callback import EarlyStopping as XGBoostEarlyStopping
 from lightgbm import LGBMRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-
+from matplotlib.ticker import FuncFormatter
 
 # =========================
 # CONFIG
@@ -74,11 +74,14 @@ def calculate_metrics(y_true, y_pred):
     denom = np.maximum(np.abs(y_true), eps)
     mape = float(np.mean(np.abs((y_true - y_pred) / denom)) * 100)
 
-    # ✅ Đã xóa Accuracy theo yêu cầu
     return {"R2": r2, "MAE": mae, "RMSE": rmse, "MAPE (%)": mape}
 
 
 def build_model(model_type, params):
+    """
+    Giữ nguyên flow: trả về pipeline + cờ early_stop
+    """
+
     if model_type == "Random Forest":
         base_model = RandomForestRegressor(
             n_estimators=int(params["n_estimators"]),
@@ -106,7 +109,7 @@ def build_model(model_type, params):
         )
         use_early_stop = True
 
-    else:  # LightGBM
+    elif model_type == "LightGBM":
         base_model = LGBMRegressor(
             n_estimators=int(params["n_estimators"]),
             max_depth=-1 if int(params["max_depth"]) == 0 else int(params["max_depth"]),
@@ -121,6 +124,15 @@ def build_model(model_type, params):
         )
         use_early_stop = True
 
+    else:  # HistGradientBoosting (theo notebook bạn)
+        base_model = HistGradientBoostingRegressor(
+            learning_rate=float(params["learning_rate"]),
+            max_iter=int(params["max_iter"]),
+            max_depth=None if int(params["max_depth"]) == 0 else int(params["max_depth"]),
+            random_state=42
+        )
+        use_early_stop = False
+
     pipeline = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("model", base_model)
@@ -129,57 +141,82 @@ def build_model(model_type, params):
 
 
 def train_and_eval(model_pipeline, use_early_stop, model_type, X_tr, y_tr, X_vl, y_vl, early_rounds=50):
+    """
+    - Không để app crash
+    - XGBoost: thử early_stopping_rounds / callback tùy version, nếu fail -> train không early stop
+    """
     if use_early_stop:
         X_tr_imp = model_pipeline.named_steps["imputer"].fit_transform(X_tr)
         X_vl_imp = model_pipeline.named_steps["imputer"].transform(X_vl)
         model = model_pipeline.named_steps["model"]
 
         if model_type == "XGBoost":
-            # ✅ FIX: dùng callback EarlyStopping (ổn định trên Streamlit Cloud)
-            cb = XGBoostEarlyStopping(rounds=int(early_rounds), save_best=True, maximize=False)
-            model.fit(
-                X_tr_imp, y_tr,
-                eval_set=[(X_vl_imp, y_vl)],
-                verbose=False,
-                callbacks=[cb]
-            )
-            y_pred_vl = model.predict(X_vl_imp)
+            # 1) thử early_stopping_rounds (nhiều bản xgboost support)
+            try:
+                model.fit(
+                    X_tr_imp, y_tr,
+                    eval_set=[(X_vl_imp, y_vl)],
+                    verbose=False,
+                    early_stopping_rounds=int(early_rounds)
+                )
+            except TypeError:
+                # 2) fallback: train bình thường (KHÔNG early stopping) để không crash
+                model.fit(X_tr_imp, y_tr)
 
-        else:  # LightGBM: train bình thường (nhanh), muốn dừng sớm thì nâng cấp sau
+            y_pred_vl = model.predict(X_vl_imp)
+            return model_pipeline, y_pred_vl
+
+        else:  # LightGBM
+            # LightGBM sklearn API ổn định, train nhanh
             model.fit(
                 X_tr_imp, y_tr,
                 eval_set=[(X_vl_imp, y_vl)],
                 eval_metric="l2",
             )
             y_pred_vl = model.predict(X_vl_imp)
+            return model_pipeline, y_pred_vl
 
-        return model_pipeline, y_pred_vl
-
-    # RandomForest
+    # RF / HistGB
     model_pipeline.fit(X_tr, y_tr)
     y_pred_vl = model_pipeline.predict(X_vl)
     return model_pipeline, y_pred_vl
 
 
+def _plain_number_formatter():
+    # hiển thị 15690000 thay vì 1.569e7
+    return FuncFormatter(lambda x, pos: f"{int(x):d}")
+
+
 def plot_scatter(y_true, y_pred):
-    fig = plt.figure(figsize=(7, 5))
-    plt.scatter(y_true, y_pred, alpha=0.5)
+    fig, ax = plt.subplots(figsize=(6.2, 4.2))
+    ax.scatter(y_true, y_pred, alpha=0.5)
+
     mn = float(min(np.min(y_true), np.min(y_pred)))
     mx = float(max(np.max(y_true), np.max(y_pred)))
-    plt.plot([mn, mx], [mn, mx], "r--")
-    plt.title("So sánh Giá Thật vs Giá Dự đoán (Validation)")
-    plt.xlabel("Giá thật")
-    plt.ylabel("Giá dự đoán")
+    ax.plot([mn, mx], [mn, mx], "r--")
+
+    ax.set_title("So sánh Giá Thật vs Giá Dự đoán (Validation)")
+    ax.set_xlabel("Giá thật")
+    ax.set_ylabel("Giá dự đoán")
+
+    ax.xaxis.set_major_formatter(_plain_number_formatter())
+    ax.yaxis.set_major_formatter(_plain_number_formatter())
+    ax.ticklabel_format(style="plain", axis="both", useOffset=False)
+
     st.pyplot(fig)
 
 
 def plot_residuals(y_true, y_pred):
     residuals = y_true - y_pred
-    fig = plt.figure(figsize=(7, 5))
-    plt.hist(residuals, bins=30)
-    plt.title("Phân phối Sai số (Residuals) - Validation")
-    plt.xlabel("Sai số (giá thật - giá dự đoán)")
-    plt.ylabel("Số lượng")
+    fig, ax = plt.subplots(figsize=(6.2, 4.2))
+    ax.hist(residuals, bins=30)
+    ax.set_title("Phân phối Sai số (Residuals) - Validation")
+    ax.set_xlabel("Sai số (giá thật - giá dự đoán)")
+    ax.set_ylabel("Số lượng")
+
+    ax.xaxis.set_major_formatter(_plain_number_formatter())
+    ax.ticklabel_format(style="plain", axis="x", useOffset=False)
+
     st.pyplot(fig)
 
 
@@ -194,10 +231,10 @@ def plot_feature_importance(model_pipeline, feature_names, top_k=15):
     names = [feature_names[i] for i in idx]
     vals = importances[idx]
 
-    fig = plt.figure(figsize=(7, 6))
-    plt.barh(names, vals)
-    plt.title(f"Top {top_k} Feature Importance")
-    plt.xlabel("Mức độ quan trọng")
+    fig, ax = plt.subplots(figsize=(6.2, 4.8))
+    ax.barh(names, vals)
+    ax.set_title(f"Top {top_k} Feature Importance")
+    ax.set_xlabel("Mức độ quan trọng")
     st.pyplot(fig)
 
 
@@ -223,17 +260,20 @@ val_path = val_up if val_up else "data_validation.csv"
 test_path = test_up if test_up else "data_test.csv"
 
 st.sidebar.header("2) Chọn mô hình & tham số")
-model_choice = st.sidebar.selectbox("Mô hình", ["Random Forest", "XGBoost", "LightGBM"])
+
+# ✅ thêm HistGB theo notebook bạn (để ra ~0.85 giống bạn nói)
+model_choice = st.sidebar.selectbox(
+    "Mô hình",
+    ["Random Forest", "XGBoost", "LightGBM", "HistGradientBoosting (theo notebook của bạn)"]
+)
 
 fast_mode = st.sidebar.checkbox("⚡ Huấn luyện nhanh (khuyến nghị)", value=True)
 
-# Chỉ hiển thị early stopping khi chọn XGBoost
 early_rounds = None
 if model_choice == "XGBoost":
     early_rounds = st.sidebar.slider("Dừng sớm (Early stopping)", 10, 200, 50, 10)
     st.sidebar.caption(
-        "Tự động dừng huấn luyện nếu mô hình không cải thiện trên Validation sau N vòng. "
-        "Giúp train nhanh và tránh overfitting."
+        "Tự động dừng nếu mô hình không cải thiện trên Validation sau N vòng (nếu môi trường hỗ trợ)."
     )
 
 params = {}
@@ -241,71 +281,72 @@ params = {}
 # ===== Random Forest =====
 if model_choice == "Random Forest":
     params["n_estimators"] = st.sidebar.slider(
-        "Số lượng cây (n_estimators)", 50, 600, 200 if fast_mode else 400, 50
+        "Số lượng cây (n_estimators)", 50, 600, 400 if fast_mode else 500, 50
     )
-    st.sidebar.caption("Số cây càng nhiều → thường tốt hơn nhưng train chậm hơn. Gợi ý: 200–500.")
+    st.sidebar.caption("Số cây nhiều hơn → thường tốt hơn nhưng train chậm hơn. Gợi ý: 300–600.")
 
     params["max_depth"] = st.sidebar.slider(
-        "Độ sâu tối đa của cây (max_depth) - 0 = không giới hạn", 0, 30, 0 if fast_mode else 12, 1
+        "Độ sâu tối đa (max_depth) - 0 = không giới hạn", 0, 30, 0 if fast_mode else 12, 1
     )
-    st.sidebar.caption("Độ sâu lớn → mô hình phức tạp hơn (dễ overfit). Gợi ý: 8–16 hoặc 0 nếu muốn thử.")
+    st.sidebar.caption("Giới hạn độ sâu để giảm overfit. Gợi ý: 8–16 hoặc 0 nếu muốn thử.")
 
     params["min_samples_split"] = st.sidebar.slider(
         "Số mẫu tối thiểu để tách nhánh (min_samples_split)", 2, 20, 2, 1
     )
-    st.sidebar.caption("Tăng giá trị này → cây ‘khó tách’ hơn → giảm overfit.")
+    st.sidebar.caption("Tăng giá trị này → giảm overfit.")
 
     params["min_samples_leaf"] = st.sidebar.slider(
-        "Số mẫu tối thiểu trong 1 lá (min_samples_leaf)", 1, 20, 1, 1
+        "Số mẫu tối thiểu tại lá (min_samples_leaf)", 1, 20, 1, 1
     )
-    st.sidebar.caption("Tăng giá trị này → mô hình ổn định hơn, nhưng có thể giảm độ chính xác.")
+    st.sidebar.caption("Tăng giá trị này → mô hình ổn định hơn nhưng có thể giảm độ khớp.")
 
 # ===== XGBoost =====
 elif model_choice == "XGBoost":
+    # ✅ mặc định “gần tối ưu” để bạn dễ lên R2 (bạn chỉnh được)
     params["n_estimators"] = st.sidebar.slider(
-        "Số vòng boosting (n_estimators)", 200, 2500, 600 if fast_mode else 1500, 100
+        "Số vòng boosting (n_estimators)", 200, 2500, 1200 if fast_mode else 1800, 100
     )
-    st.sidebar.caption("Giống ‘số cây / số vòng’ tăng dần. Nhiều quá sẽ chậm; dùng Early stopping để dừng sớm.")
+    st.sidebar.caption("Số vòng càng nhiều → mô hình càng mạnh nhưng dễ overfit. Dùng dừng sớm để tự ngắt.")
 
-    params["max_depth"] = st.sidebar.slider("Độ sâu cây (max_depth)", 2, 12, 6 if fast_mode else 8, 1)
-    st.sidebar.caption("Độ sâu lớn → bắt pattern mạnh hơn nhưng dễ overfit. Gợi ý: 4–8.")
+    params["max_depth"] = st.sidebar.slider("Độ sâu cây (max_depth)", 2, 12, 6, 1)
+    st.sidebar.caption("Độ sâu lớn → mạnh hơn nhưng dễ overfit. Gợi ý: 4–8.")
 
     params["learning_rate"] = st.sidebar.number_input(
-        "Tốc độ học (learning_rate)", 0.005, 0.3, 0.05 if fast_mode else 0.03, step=0.005
+        "Tốc độ học (learning_rate)", 0.005, 0.3, 0.05, step=0.005
     )
-    st.sidebar.caption("Learning rate nhỏ → cần nhiều vòng hơn nhưng ổn định hơn. Gợi ý: 0.03–0.1.")
+    st.sidebar.caption("Nhỏ hơn → ổn định hơn nhưng cần nhiều vòng hơn. Gợi ý: 0.03–0.08.")
 
     params["subsample"] = st.sidebar.slider("Tỉ lệ lấy mẫu dữ liệu (subsample)", 0.5, 1.0, 0.9, 0.05)
-    st.sidebar.caption("Giảm <1.0 giúp chống overfit (lấy ngẫu nhiên 1 phần dữ liệu mỗi vòng).")
+    st.sidebar.caption("Giảm <1.0 giúp chống overfit.")
 
     params["colsample_bytree"] = st.sidebar.slider("Tỉ lệ lấy mẫu feature (colsample_bytree)", 0.5, 1.0, 0.9, 0.05)
-    st.sidebar.caption("Giảm <1.0 giúp chống overfit (mỗi cây chỉ dùng một phần feature).")
+    st.sidebar.caption("Giảm <1.0 giúp chống overfit.")
 
-    params["reg_alpha"] = st.sidebar.number_input("Regularization L1 (reg_alpha)", 0.0, 10.0, 0.0, step=0.1)
-    st.sidebar.caption("Tăng lên nếu bạn thấy overfit hoặc feature nhiễu nhiều.")
+    params["reg_alpha"] = st.sidebar.number_input("Phạt L1 (reg_alpha)", 0.0, 10.0, 0.0, step=0.1)
+    st.sidebar.caption("Tăng nếu dữ liệu nhiễu hoặc overfit.")
 
-    params["reg_lambda"] = st.sidebar.number_input("Regularization L2 (reg_lambda)", 0.0, 10.0, 1.0, step=0.1)
-    st.sidebar.caption("Thường để ~1.0. Tăng lên nếu muốn mô hình ‘mượt’ hơn.")
+    params["reg_lambda"] = st.sidebar.number_input("Phạt L2 (reg_lambda)", 0.0, 10.0, 2.0, step=0.1)
+    st.sidebar.caption("Tăng để mô hình ‘mượt’ hơn và giảm overfit.")
 
 # ===== LightGBM =====
-else:
+elif model_choice == "LightGBM":
     params["n_estimators"] = st.sidebar.slider(
-        "Số vòng boosting (n_estimators)", 200, 5000, 800 if fast_mode else 2500, 100
+        "Số vòng boosting (n_estimators)", 200, 5000, 1200 if fast_mode else 2500, 100
     )
     st.sidebar.caption("Nhiều vòng hơn → có thể tốt hơn nhưng chậm hơn. Gợi ý: 800–2500.")
 
     params["max_depth"] = st.sidebar.slider(
-        "Độ sâu tối đa (max_depth) - 0 = không giới hạn", 0, 30, 0 if fast_mode else 10, 1
+        "Độ sâu tối đa (max_depth) - 0 = không giới hạn", 0, 30, 10 if fast_mode else 12, 1
     )
-    st.sidebar.caption("Giới hạn depth để tránh overfit. Gợi ý: 6–12 hoặc 0 nếu muốn thử.")
+    st.sidebar.caption("Giới hạn depth để tránh overfit. Gợi ý: 6–12.")
 
     params["learning_rate"] = st.sidebar.number_input(
-        "Tốc độ học (learning_rate)", 0.005, 0.3, 0.05 if fast_mode else 0.03, step=0.005
+        "Tốc độ học (learning_rate)", 0.005, 0.3, 0.05, step=0.005
     )
-    st.sidebar.caption("Nhỏ hơn → ổn định hơn nhưng cần nhiều vòng hơn. Gợi ý: 0.03–0.1.")
+    st.sidebar.caption("Nhỏ hơn → ổn định hơn nhưng cần nhiều vòng hơn. Gợi ý: 0.03–0.08.")
 
-    params["num_leaves"] = st.sidebar.slider("Số lá tối đa (num_leaves)", 15, 127, 31 if fast_mode else 63, 2)
-    st.sidebar.caption("num_leaves lớn → mô hình mạnh hơn nhưng dễ overfit. Gợi ý: 31–63.")
+    params["num_leaves"] = st.sidebar.slider("Số lá tối đa (num_leaves)", 15, 127, 63 if fast_mode else 63, 2)
+    st.sidebar.caption("num_leaves lớn → mạnh hơn nhưng dễ overfit. Gợi ý: 31–63.")
 
     params["subsample"] = st.sidebar.slider("Tỉ lệ lấy mẫu dữ liệu (subsample)", 0.5, 1.0, 0.9, 0.05)
     st.sidebar.caption("Giảm <1.0 giúp chống overfit.")
@@ -313,11 +354,25 @@ else:
     params["colsample_bytree"] = st.sidebar.slider("Tỉ lệ lấy mẫu feature (colsample_bytree)", 0.5, 1.0, 0.9, 0.05)
     st.sidebar.caption("Giảm <1.0 giúp chống overfit.")
 
-    params["reg_alpha"] = st.sidebar.number_input("Regularization L1 (reg_alpha)", 0.0, 10.0, 0.0, step=0.1)
+    params["reg_alpha"] = st.sidebar.number_input("Phạt L1 (reg_alpha)", 0.0, 10.0, 0.0, step=0.1)
     st.sidebar.caption("Tăng nếu dữ liệu nhiễu hoặc overfit.")
 
-    params["reg_lambda"] = st.sidebar.number_input("Regularization L2 (reg_lambda)", 0.0, 10.0, 0.0, step=0.1)
+    params["reg_lambda"] = st.sidebar.number_input("Phạt L2 (reg_lambda)", 0.0, 10.0, 0.0, step=0.1)
     st.sidebar.caption("Tăng nếu muốn mô hình ổn định hơn.")
+
+# ===== HistGradientBoosting (theo notebook bạn) =====
+else:
+    # ✅ mặc định đúng notebook của bạn: learning_rate=0.1, max_iter=100, max_depth=5
+    params["learning_rate"] = st.sidebar.number_input(
+        "Tốc độ học (learning_rate)", 0.01, 0.3, 0.10, step=0.01
+    )
+    st.sidebar.caption("Notebook bạn dùng 0.1. Nhỏ hơn → ổn định hơn nhưng cần nhiều vòng hơn.")
+
+    params["max_iter"] = st.sidebar.slider("Số vòng lặp (max_iter)", 50, 400, 100, 25)
+    st.sidebar.caption("Notebook bạn dùng 100. Tăng lên có thể tốt hơn nhưng chậm hơn.")
+
+    params["max_depth"] = st.sidebar.slider("Độ sâu tối đa (max_depth) - 0 = không giới hạn", 0, 20, 5, 1)
+    st.sidebar.caption("Notebook bạn dùng 5. Giới hạn depth giúp giảm overfit.")
 
 
 # =========================
@@ -340,7 +395,6 @@ except Exception as e:
     st.stop()
 
 tab1, tab2, tab3, tab4 = st.tabs(["📌 Xem dữ liệu", "🧠 Huấn luyện & Đánh giá", "🎯 Dự đoán", "📤 Xuất file"])
-
 
 with tab1:
     st.subheader("Xem nhanh dữ liệu (head)")
@@ -389,7 +443,13 @@ with tab2:
         m_cols = st.columns(4)
         keys = list(metrics_vl.keys())
         for i, k in enumerate(keys):
-            m_cols[i].metric(k, f"{metrics_vl[k]:,.2f}")
+            m_cols[i].metric(k, f"{metrics_vl[k]:,.4f}" if k == "R2" else f"{metrics_vl[k]:,.2f}")
+
+        # ✅ chú thích metric theo yêu cầu
+        st.caption("**R2**: càng gần 1 càng tốt (mô hình giải thích được biến động giá).")
+        st.caption("**MAE**: sai số tuyệt đối trung bình (đơn vị: VND) — càng nhỏ càng tốt.")
+        st.caption("**RMSE**: giống MAE nhưng phạt nặng lỗi lớn hơn (đơn vị: VND) — càng nhỏ càng tốt.")
+        st.caption("**MAPE**: % sai số trung bình so với giá thật — càng nhỏ càng tốt.")
 
         st.markdown("### Biểu đồ (1 ảnh / 1 hàng)")
         plot_scatter(y_vl.values, st.session_state["y_pred_vl"])
