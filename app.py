@@ -412,33 +412,33 @@ elif model_choice == "XGBoost":
     params["reg_lambda"] = st.sidebar.number_input("reg_lambda", 0.0, 20.0, 2.0, step=0.1)
     st.sidebar.caption("L2 regularization. Tăng → model mượt hơn. Notebook dùng 2.0.")
 
-else:  # LightGBM
-    params["n_estimators"] = st.sidebar.slider("n_estimators", 500, 12000, 4000, 100)
-    st.sidebar.caption("Early stopping sẽ chọn best iteration, bạn có thể để lớn.")
+else:  # LightGBM (DEFAULT mới)
+    params["n_estimators"] = st.sidebar.slider("n_estimators", 500, 12000, 6000, 100)
+    st.sidebar.caption("Default 6000: để early stopping tự chọn best iteration.")
 
-    params["learning_rate"] = st.sidebar.number_input("learning_rate", 0.005, 0.3, 0.03, step=0.005)
-    st.sidebar.caption("0.01–0.05 thường ổn. Nhỏ hơn → cần nhiều cây hơn.")
+    params["learning_rate"] = st.sidebar.number_input("learning_rate", 0.005, 0.3, 0.02, step=0.005)
+    st.sidebar.caption("Default 0.02: ổn định hơn 0.03 nếu dữ liệu nhiễu.")
 
-    params["max_depth"] = st.sidebar.slider("max_depth (0 = -1)", 0, 30, 0, 1)
-    st.sidebar.caption("0 = không giới hạn. Nếu overfit → thử 6–16.")
+    params["max_depth"] = st.sidebar.slider("max_depth (0 = -1)", 0, 30, 12, 1)
+    st.sidebar.caption("Default 12: giới hạn độ sâu để giảm overfit.")
 
     params["num_leaves"] = st.sidebar.slider("num_leaves", 15, 255, 63, 2)
-    st.sidebar.caption("Tăng → mạnh hơn nhưng dễ overfit. Nếu Test thấp → giảm (31–127).")
+    st.sidebar.caption("Default 63: cân bằng sức mạnh và overfit.")
 
-    params["min_child_samples"] = st.sidebar.slider("min_child_samples", 5, 200, 20, 5)
-    st.sidebar.caption("Tăng → mỗi lá cần nhiều mẫu hơn → giảm overfit (20–80).")
+    params["min_child_samples"] = st.sidebar.slider("min_child_samples", 5, 200, 40, 5)
+    st.sidebar.caption("Default 40: tăng để chống overfit, thường giúp Test R2.")
 
-    params["subsample"] = st.sidebar.slider("subsample", 0.5, 1.0, 0.9, 0.05)
-    st.sidebar.caption("Giảm nhẹ (0.7–0.9) giúp chống overfit.")
+    params["subsample"] = st.sidebar.slider("subsample", 0.5, 1.0, 0.85, 0.05)
+    st.sidebar.caption("Default 0.85: subsample nhẹ để generalize tốt hơn.")
 
-    params["colsample_bytree"] = st.sidebar.slider("colsample_bytree", 0.5, 1.0, 0.9, 0.05)
-    st.sidebar.caption("Giảm nhẹ (0.7–0.9) giúp generalize tốt hơn.")
+    params["colsample_bytree"] = st.sidebar.slider("colsample_bytree", 0.5, 1.0, 0.85, 0.05)
+    st.sidebar.caption("Default 0.85: giảm nhẹ để bớt phụ thuộc feature nhiễu.")
 
-    params["reg_alpha"] = st.sidebar.number_input("reg_alpha", 0.0, 10.0, 0.0, step=0.1)
-    st.sidebar.caption("L1. Tăng nhẹ nếu feature nhiễu.")
+    params["reg_alpha"] = st.sidebar.number_input("reg_alpha", 0.0, 10.0, 0.2, step=0.1)
+    st.sidebar.caption("Default 0.2: regularization nhẹ.")
 
-    params["reg_lambda"] = st.sidebar.number_input("reg_lambda", 0.0, 10.0, 0.0, step=0.1)
-    st.sidebar.caption("L2. Tăng nhẹ để mượt và bớt overfit.")
+    params["reg_lambda"] = st.sidebar.number_input("reg_lambda", 0.0, 10.0, 2.0, step=0.1)
+    st.sidebar.caption("Default 2.0: L2 giúp mượt và ổn định hơn.")
 
 # =========================
 # MAIN
@@ -612,4 +612,5 @@ with tab4:
 
         csv = test_results.to_csv(index=False).encode("utf-8")
         st.download_button("📊 Tải test_predictions.csv", csv, "test_predictions.csv", "text/csv")
+
 
