@@ -1,4 +1,5 @@
 import streamlit as st
+import inspect
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -195,47 +196,73 @@ def predict_price(model_pipeline, X, use_log_target: bool):
     return pred
 
 
-def train_model(pipeline, use_early_stop, use_log_target, model_type, X_tr, y_tr, X_vl, y_vl, early_rounds=100):
+def train_model(pipeline, use_early_stop, use_log_target, model_type,
+                X_tr, y_tr, X_vl, y_vl, early_rounds=100):
+
     y_tr_fit = _safe_log1p(y_tr) if use_log_target else np.asarray(y_tr, dtype=float)
     y_vl_fit = _safe_log1p(y_vl) if use_log_target else np.asarray(y_vl, dtype=float)
+
+    # ép y về 1D numpy (xgboost rất hay kén shape)
+    y_tr_fit = np.asarray(y_tr_fit, dtype=np.float32).ravel()
+    y_vl_fit = np.asarray(y_vl_fit, dtype=np.float32).ravel()
 
     if not use_early_stop:
         pipeline.fit(X_tr, y_tr_fit)
         return pipeline
 
-    # Early stopping: cần imputer trước
+    # Early stopping: fit imputer trước
     X_tr_imp = pipeline.named_steps["imputer"].fit_transform(X_tr)
     X_vl_imp = pipeline.named_steps["imputer"].transform(X_vl)
+
+    # ép dtype float32 (xgboost trên cloud hay kén float64/object)
+    X_tr_imp = np.asarray(X_tr_imp, dtype=np.float32)
+    X_vl_imp = np.asarray(X_vl_imp, dtype=np.float32)
+
     model = pipeline.named_steps["model"]
 
+    # ========= XGBOOST (fix compat) =========
     if model_type == "XGBoost":
-        # tương thích nhiều phiên bản xgboost
-        try:
-            model.fit(
-                X_tr_imp,
-                y_tr_fit,
-                eval_set=[(X_vl_imp, y_vl_fit)],
-                verbose=False,
-                early_stopping_rounds=int(early_rounds),
-            )
-        except TypeError:
-            from xgboost.callback import EarlyStopping
+        fit_params = inspect.signature(model.fit).parameters
 
-            cb = EarlyStopping(rounds=int(early_rounds), save_best=True, maximize=False)
-            model.fit(
-                X_tr_imp,
-                y_tr_fit,
-                eval_set=[(X_vl_imp, y_vl_fit)],
-                verbose=False,
-                callbacks=[cb],
-            )
+        # Case A: hỗ trợ early_stopping_rounds (phổ biến)
+        if "early_stopping_rounds" in fit_params:
+            try:
+                model.fit(
+                    X_tr_imp, y_tr_fit,
+                    eval_set=[(X_vl_imp, y_vl_fit)],
+                    verbose=False,
+                    early_stopping_rounds=int(early_rounds),
+                )
+                return pipeline
+            except TypeError:
+                pass
+            except Exception:
+                # nếu fail vì lý do khác thì thử phương án khác bên dưới
+                pass
+
+        # Case B: hỗ trợ callbacks (một số version)
+        if "callbacks" in fit_params:
+            try:
+                from xgboost.callback import EarlyStopping
+                cb = EarlyStopping(rounds=int(early_rounds), save_best=True)
+                model.fit(
+                    X_tr_imp, y_tr_fit,
+                    eval_set=[(X_vl_imp, y_vl_fit)],
+                    verbose=False,
+                    callbacks=[cb],
+                )
+                return pipeline
+            except Exception:
+                pass
+
+        # Case C: fallback cuối cùng - train thường (không early stopping) để app không crash
+        model.fit(X_tr_imp, y_tr_fit)
         return pipeline
 
-    # LightGBM
+    # ========= LIGHTGBM =========
     try:
         model.fit(
-            X_tr_imp,
-            y_tr_fit,
+            X_tr_imp, y_tr_fit,
             eval_set=[(X_vl_imp, y_vl_fit)],
             eval_metric="rmse",
             callbacks=[lgb.early_stopping(int(early_rounds), verbose=False)],
@@ -585,3 +612,4 @@ with tab4:
 
         csv = test_results.to_csv(index=False).encode("utf-8")
         st.download_button("📊 Tải test_predictions.csv", csv, "test_predictions.csv", "text/csv")
+
