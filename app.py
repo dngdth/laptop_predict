@@ -8,22 +8,33 @@ import os
 from sklearn.ensemble import RandomForestRegressor
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
+import lightgbm as lgb
+
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-
 
 # =========================
 # CONFIG
 # =========================
 st.set_page_config(page_title="Ứng dụng Dự đoán Giá Laptop", layout="wide")
 
+# =========================
+# UTILS UI
+# =========================
+def muted(text: str):
+    st.markdown(f"<span style='color:#8a8a8a; font-size: 0.9rem'>{text}</span>", unsafe_allow_html=True)
+
+def fmt_money(x):
+    try:
+        return f"{float(x):,.0f}"
+    except Exception:
+        return str(x)
 
 # =========================
 # FUNCTIONS
 # =========================
 def read_csv_safely(file_or_path):
-    # UploadedFile hoặc path
     try:
         return pd.read_csv(file_or_path, encoding="utf-8")
     except Exception:
@@ -38,7 +49,6 @@ def load_data(train_file, val_file, test_file):
 
 
 def align_columns(df_train, df_val, df_test, target="price_base"):
-    # Drop title nếu có
     def _drop_title(df):
         if "title" in df.columns:
             return df.drop(columns=["title"])
@@ -48,15 +58,12 @@ def align_columns(df_train, df_val, df_test, target="price_base"):
     df_val = _drop_title(df_val)
     df_test = _drop_title(df_test)
 
-    # intersection columns
-    common_cols = list(set(df_train.columns) & set(df_val.columns) & set(df_test.columns))
-
     if target not in df_train.columns or target not in df_val.columns or target not in df_test.columns:
         raise ValueError(f"Thiếu cột target '{target}' trong 1 trong 3 tập dữ liệu.")
 
+    common_cols = list(set(df_train.columns) & set(df_val.columns) & set(df_test.columns))
     if target in common_cols:
         common_cols.remove(target)
-
     common_cols.sort()
 
     X_train = df_train[common_cols].copy()
@@ -68,49 +75,52 @@ def align_columns(df_train, df_val, df_test, target="price_base"):
     X_test = df_test[common_cols].copy()
     y_test = df_test[target].copy()
 
-    # Ép numeric (object -> NaN), imputer median sẽ xử lý
     for c in common_cols:
         X_train[c] = pd.to_numeric(X_train[c], errors="coerce")
         X_val[c] = pd.to_numeric(X_val[c], errors="coerce")
         X_test[c] = pd.to_numeric(X_test[c], errors="coerce")
 
-    # tránh crash vì inf
     X_train = X_train.replace([np.inf, -np.inf], np.nan)
     X_val = X_val.replace([np.inf, -np.inf], np.nan)
     X_test = X_test.replace([np.inf, -np.inf], np.nan)
 
+    # target to numeric (if string)
+    y_train = pd.to_numeric(y_train, errors="coerce")
+    y_val = pd.to_numeric(y_val, errors="coerce")
+    y_test = pd.to_numeric(y_test, errors="coerce")
+
+    # drop rows where y is NaN
+    tr_mask = ~y_train.isna()
+    vl_mask = ~y_val.isna()
+    ts_mask = ~y_test.isna()
+
+    X_train, y_train = X_train.loc[tr_mask], y_train.loc[tr_mask]
+    X_val, y_val = X_val.loc[vl_mask], y_val.loc[vl_mask]
+    X_test, y_test = X_test.loc[ts_mask], y_test.loc[ts_mask]
+
     return X_train, y_train, X_val, y_val, X_test, y_test, common_cols
 
 
-def acc_within_threshold(y_true, y_pred, threshold=5_000_000):
+def calculate_metrics_row(name, y_true, y_pred):
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
-    diff = np.abs(y_true - y_pred)
-    return float(np.mean(diff <= threshold) * 100.0)
 
-
-def calculate_metrics_row(name, y_true, y_pred):
     r2 = float(r2_score(y_true, y_pred))
     mae = float(mean_absolute_error(y_true, y_pred))
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
     eps = 1e-8
-    denom = np.maximum(np.abs(np.asarray(y_true, dtype=float)), eps)
-    mape = float(np.mean(np.abs((np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)) / denom)) * 100.0)
+    denom = np.maximum(np.abs(y_true), eps)
+    mape = float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
 
-    acc5 = acc_within_threshold(y_true, y_pred, threshold=5_000_000)
-
-    return {
-        "Dataset": name,
-        "R2": r2,
-        "MAE": mae,
-        "RMSE": rmse,
-        "MAPE (%)": mape,
-        "Acc<=5Tr(%)": acc5
-    }
+    return {"Dataset": name, "R2": r2, "MAE": mae, "RMSE": rmse, "MAPE (%)": mape}
 
 
 def build_model(model_type, params):
+    """
+    - RandomForest: train trực tiếp.
+    - XGBoost/LightGBM: train theo notebook -> dùng log1p(price_base), predict -> expm1.
+    """
     if model_type == "Random Forest":
         base_model = RandomForestRegressor(
             n_estimators=int(params["n_estimators"]),
@@ -119,100 +129,127 @@ def build_model(model_type, params):
             min_samples_leaf=int(params["min_samples_leaf"]),
             max_features=float(params["max_features"]),
             n_jobs=-1,
-            random_state=42
+            random_state=42,
         )
         use_early_stop = False
+        use_log_target = False
 
     elif model_type == "XGBoost":
+        # theo notebook model_XGBoost.ipynb: log1p target + giảm overfit mạnh
         base_model = XGBRegressor(
             n_estimators=int(params["n_estimators"]),
-            max_depth=int(params["max_depth"]),
             learning_rate=float(params["learning_rate"]),
+            max_depth=int(params["max_depth"]),
+            min_child_weight=float(params["min_child_weight"]),
+            gamma=float(params["gamma"]),
             subsample=float(params["subsample"]),
             colsample_bytree=float(params["colsample_bytree"]),
             reg_alpha=float(params["reg_alpha"]),
             reg_lambda=float(params["reg_lambda"]),
-            min_child_weight=float(params["min_child_weight"]),
-            gamma=float(params["gamma"]),
             objective="reg:squarederror",
             eval_metric="rmse",
             tree_method="hist",
             n_jobs=-1,
-            random_state=42
+            random_state=42,
         )
         use_early_stop = True
+        use_log_target = True
 
     else:  # LightGBM
+        # theo ý tưởng notebook Tu_LightGBM.ipynb: log1p target + early stopping
         base_model = LGBMRegressor(
             n_estimators=int(params["n_estimators"]),
-            max_depth=-1 if int(params["max_depth"]) == 0 else int(params["max_depth"]),
             learning_rate=float(params["learning_rate"]),
+            max_depth=-1 if int(params["max_depth"]) == 0 else int(params["max_depth"]),
             num_leaves=int(params["num_leaves"]),
+            min_child_samples=int(params["min_child_samples"]),
             subsample=float(params["subsample"]),
             colsample_bytree=float(params["colsample_bytree"]),
             reg_alpha=float(params["reg_alpha"]),
             reg_lambda=float(params["reg_lambda"]),
-            min_child_samples=int(params["min_child_samples"]),
             random_state=42,
-            n_jobs=-1
+            n_jobs=-1,
         )
         use_early_stop = True
+        use_log_target = True
 
-    pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("model", base_model)
-    ])
-    return pipeline, use_early_stop
+    pipeline = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("model", base_model),
+        ]
+    )
+    return pipeline, use_early_stop, use_log_target
 
 
-def train_model(pipeline, use_early_stop, model_type, X_tr, y_tr, X_vl, y_vl, early_rounds=50):
-    if use_early_stop:
-        X_tr_imp = pipeline.named_steps["imputer"].fit_transform(X_tr)
-        X_vl_imp = pipeline.named_steps["imputer"].transform(X_vl)
-        model = pipeline.named_steps["model"]
+def _safe_log1p(y):
+    y = np.asarray(y, dtype=float)
+    y = np.where(y < 0, 0.0, y)
+    return np.log1p(y)
 
-        if model_type == "XGBoost":
-            try:
-                model.fit(
-                    X_tr_imp, y_tr,
-                    eval_set=[(X_vl_imp, y_vl)],
-                    verbose=False,
-                    early_stopping_rounds=int(early_rounds)
-                )
-            except TypeError:
-                try:
-                    from xgboost.callback import EarlyStopping
-                    cb = EarlyStopping(rounds=int(early_rounds), save_best=True, maximize=False)
-                    model.fit(
-                        X_tr_imp, y_tr,
-                        eval_set=[(X_vl_imp, y_vl)],
-                        verbose=False,
-                        callbacks=[cb]
-                    )
-                except Exception:
-                    model.fit(X_tr_imp, y_tr)
 
-        else:  # LightGBM
-            try:
-                model.fit(
-                    X_tr_imp, y_tr,
-                    eval_set=[(X_vl_imp, y_vl)],
-                    eval_metric="l2",
-                )
-            except TypeError:
-                model.fit(X_tr_imp, y_tr)
+def predict_price(model_pipeline, X, use_log_target: bool):
+    pred = model_pipeline.predict(X)
+    if use_log_target:
+        pred = np.expm1(pred)
+    return pred
 
+
+def train_model(pipeline, use_early_stop, use_log_target, model_type, X_tr, y_tr, X_vl, y_vl, early_rounds=100):
+    y_tr_fit = _safe_log1p(y_tr) if use_log_target else np.asarray(y_tr, dtype=float)
+    y_vl_fit = _safe_log1p(y_vl) if use_log_target else np.asarray(y_vl, dtype=float)
+
+    if not use_early_stop:
+        pipeline.fit(X_tr, y_tr_fit)
         return pipeline
 
-    pipeline.fit(X_tr, y_tr)
+    # Early stopping: cần imputer trước
+    X_tr_imp = pipeline.named_steps["imputer"].fit_transform(X_tr)
+    X_vl_imp = pipeline.named_steps["imputer"].transform(X_vl)
+    model = pipeline.named_steps["model"]
+
+    if model_type == "XGBoost":
+        # tương thích nhiều phiên bản xgboost
+        try:
+            model.fit(
+                X_tr_imp,
+                y_tr_fit,
+                eval_set=[(X_vl_imp, y_vl_fit)],
+                verbose=False,
+                early_stopping_rounds=int(early_rounds),
+            )
+        except TypeError:
+            from xgboost.callback import EarlyStopping
+
+            cb = EarlyStopping(rounds=int(early_rounds), save_best=True, maximize=False)
+            model.fit(
+                X_tr_imp,
+                y_tr_fit,
+                eval_set=[(X_vl_imp, y_vl_fit)],
+                verbose=False,
+                callbacks=[cb],
+            )
+        return pipeline
+
+    # LightGBM
+    try:
+        model.fit(
+            X_tr_imp,
+            y_tr_fit,
+            eval_set=[(X_vl_imp, y_vl_fit)],
+            eval_metric="rmse",
+            callbacks=[lgb.early_stopping(int(early_rounds), verbose=False)],
+        )
+    except Exception:
+        model.fit(X_tr_imp, y_tr_fit)
+
     return pipeline
 
 
 def plot_feature_importance(model_pipeline, feature_names, top_k=15):
     raw_model = model_pipeline.named_steps["model"]
-
     if not hasattr(raw_model, "feature_importances_"):
-        st.info("Model này không hỗ trợ Feature Importance.")
+        st.info("Model này không hỗ trợ feature_importances_.")
         return
 
     importances = np.asarray(raw_model.feature_importances_, dtype=float)
@@ -225,30 +262,55 @@ def plot_feature_importance(model_pipeline, feature_names, top_k=15):
     names = [feature_names[i] for i in idx]
     vals = importances[idx]
 
-    fig, ax = plt.subplots(figsize=(7.2, 5.0))
+    fig, ax = plt.subplots(figsize=(7.5, 4.6))
     ax.barh(names, vals)
-    ax.set_title(f"Top {top_k} Feature Importance")
-    ax.set_xlabel("Importance")
+    ax.set_title(f"Top {top_k} Feature Importances")
+    ax.set_xlabel("Relative Importance")
     ax.tick_params(axis="y", labelsize=9)
     fig.tight_layout()
     st.pyplot(fig)
 
 
-def predict_from_csv(trained_model, features, csv_file):
-    df_in = read_csv_safely(csv_file)
+def plot_residuals(y_true, y_pred):
+    err = np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)
 
+    fig, ax = plt.subplots(figsize=(7.5, 4.6))
+    ax.hist(err, bins=40)
+    ax.axvline(0, linestyle="--")
+    ax.set_title("Residuals Distribution (Sai số)")
+    ax.set_xlabel("Error Amount")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    st.pyplot(fig)
+
+
+def plot_actual_vs_pred(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.9))
+    ax.scatter(y_true, y_pred, alpha=0.35)
+    mn = float(np.min([y_true.min(), y_pred.min()]))
+    mx = float(np.max([y_true.max(), y_pred.max()]))
+    ax.plot([mn, mx], [mn, mx], "r--", linewidth=2)
+    ax.set_title("Actual vs Predicted Prices")
+    ax.set_xlabel("Actual Price (VND)")
+    ax.set_ylabel("Predicted Price (VND)")
+    fig.tight_layout()
+    st.pyplot(fig)
+
+
+def predict_from_csv(trained_model, features, csv_file, use_log_target):
+    df_in = read_csv_safely(csv_file)
     if df_in.shape[0] == 0:
         raise ValueError("File CSV rỗng (0 dòng).")
 
-    # thiếu cột -> NaN (imputer xử lý), thừa cột -> bỏ
     X_in = df_in.reindex(columns=features)
-
     for c in features:
         X_in[c] = pd.to_numeric(X_in[c], errors="coerce")
-
     X_in = X_in.replace([np.inf, -np.inf], np.nan)
 
-    preds = trained_model.predict(X_in)
+    preds = predict_price(trained_model, X_in, use_log_target)
     out = df_in.copy()
     out["predicted_price_base"] = preds
     return out
@@ -270,40 +332,86 @@ st.sidebar.header("2) Chọn mô hình")
 model_choice = st.sidebar.selectbox("Mô hình", ["Random Forest", "XGBoost", "LightGBM"])
 
 early_rounds = None
-if model_choice == "XGBoost":
-    early_rounds = st.sidebar.slider("Early stopping rounds", 10, 200, 50, 10)
+if model_choice in ["XGBoost", "LightGBM"]:
+    early_rounds = st.sidebar.slider("Early stopping rounds", 20, 300, 100, 10)
+    st.sidebar.caption("Tăng lên → model “kiên nhẫn” hơn; giảm → dừng sớm hơn để tránh overfit.")
 
 params = {}
 
+st.sidebar.divider()
+st.sidebar.subheader("3) Tham số (có gợi ý)")
+
 if model_choice == "Random Forest":
-    params["n_estimators"] = st.sidebar.slider("n_estimators", 100, 800, 500, 50)
-    params["max_depth"] = st.sidebar.slider("max_depth (0 = None)", 0, 40, 0, 1)
-    params["min_samples_split"] = st.sidebar.slider("min_samples_split", 2, 20, 2, 1)
-    params["min_samples_leaf"] = st.sidebar.slider("min_samples_leaf", 1, 20, 1, 1)
+    params["n_estimators"] = st.sidebar.slider("n_estimators", 200, 1200, 600, 50)
+    st.sidebar.caption("Số cây. Tăng → ổn định hơn nhưng chậm. Thường 400–900 là hợp lý.")
+
+    params["max_depth"] = st.sidebar.slider("max_depth (0 = None)", 0, 40, 20, 1)
+    st.sidebar.caption("Độ sâu tối đa. Tăng → dễ overfit. Với kết quả Train cao/Test thấp → nên đặt 12–25.")
+
+    params["min_samples_split"] = st.sidebar.slider("min_samples_split", 2, 30, 4, 1)
+    st.sidebar.caption("Tăng → khó tách nhánh hơn → giảm overfit. Gợi ý: 3–10.")
+
+    params["min_samples_leaf"] = st.sidebar.slider("min_samples_leaf", 1, 30, 2, 1)
+    st.sidebar.caption("Tăng → mỗi lá cần nhiều mẫu hơn → mượt hơn. Gợi ý: 1–6.")
+
     params["max_features"] = st.sidebar.slider("max_features", 0.2, 1.0, 0.7, 0.05)
+    st.sidebar.caption("Tỉ lệ feature mỗi cây. 0.6–0.9 thường cho Test R2 tốt hơn.")
 
 elif model_choice == "XGBoost":
-    params["n_estimators"] = st.sidebar.slider("n_estimators", 300, 4000, 2000, 100)
-    params["max_depth"] = st.sidebar.slider("max_depth", 2, 12, 6, 1)
-    params["learning_rate"] = st.sidebar.number_input("learning_rate", 0.005, 0.3, 0.03, step=0.005)
-    params["subsample"] = st.sidebar.slider("subsample", 0.5, 1.0, 0.9, 0.05)
-    params["colsample_bytree"] = st.sidebar.slider("colsample_bytree", 0.5, 1.0, 0.9, 0.05)
-    params["min_child_weight"] = st.sidebar.number_input("min_child_weight", 0.0, 50.0, 1.0, step=0.5)
-    params["gamma"] = st.sidebar.number_input("gamma", 0.0, 20.0, 0.0, step=0.1)
-    params["reg_alpha"] = st.sidebar.number_input("reg_alpha", 0.0, 10.0, 0.0, step=0.1)
-    params["reg_lambda"] = st.sidebar.number_input("reg_lambda", 0.0, 10.0, 2.0, step=0.1)
+    params["n_estimators"] = st.sidebar.slider("n_estimators", 500, 6000, 2000, 100)
+    st.sidebar.caption("Kết hợp với learning_rate nhỏ. Early stopping sẽ tự chọn best iteration.")
+
+    params["learning_rate"] = st.sidebar.number_input("learning_rate", 0.005, 0.3, 0.01, step=0.005)
+    st.sidebar.caption("Giảm → học chậm nhưng bền, hay cho Test tốt hơn (0.01–0.05).")
+
+    params["max_depth"] = st.sidebar.slider("max_depth", 2, 12, 4, 1)
+    st.sidebar.caption("Giảm → chống overfit mạnh. Notebook của bạn dùng 4.")
+
+    params["min_child_weight"] = st.sidebar.number_input("min_child_weight", 1.0, 50.0, 5.0, step=0.5)
+    st.sidebar.caption("Tăng → khó tách nhánh → giảm overfit. Notebook dùng 5.")
+
+    params["gamma"] = st.sidebar.number_input("gamma", 0.0, 20.0, 0.2, step=0.1)
+    st.sidebar.caption("Tăng → cần giảm loss đủ lớn mới split → bớt overfit. Notebook dùng 0.2.")
+
+    params["subsample"] = st.sidebar.slider("subsample", 0.5, 1.0, 0.6, 0.05)
+    st.sidebar.caption("Giảm (0.6–0.9) → chống overfit. Notebook dùng 0.6.")
+
+    params["colsample_bytree"] = st.sidebar.slider("colsample_bytree", 0.5, 1.0, 0.6, 0.05)
+    st.sidebar.caption("Giảm → mỗi cây nhìn ít feature hơn → bớt overfit. Notebook dùng 0.6.")
+
+    params["reg_alpha"] = st.sidebar.number_input("reg_alpha", 0.0, 10.0, 1.0, step=0.1)
+    st.sidebar.caption("L1 regularization. Tăng nhẹ → lọc feature nhiễu. Notebook dùng 1.0.")
+
+    params["reg_lambda"] = st.sidebar.number_input("reg_lambda", 0.0, 20.0, 2.0, step=0.1)
+    st.sidebar.caption("L2 regularization. Tăng → model mượt hơn. Notebook dùng 2.0.")
 
 else:  # LightGBM
-    params["n_estimators"] = st.sidebar.slider("n_estimators", 300, 8000, 3000, 100)
-    params["max_depth"] = st.sidebar.slider("max_depth (0 = -1)", 0, 30, 0, 1)
-    params["learning_rate"] = st.sidebar.number_input("learning_rate", 0.005, 0.3, 0.03, step=0.005)
-    params["num_leaves"] = st.sidebar.slider("num_leaves", 15, 255, 63, 2)
-    params["subsample"] = st.sidebar.slider("subsample", 0.5, 1.0, 0.9, 0.05)
-    params["colsample_bytree"] = st.sidebar.slider("colsample_bytree", 0.5, 1.0, 0.9, 0.05)
-    params["min_child_samples"] = st.sidebar.slider("min_child_samples", 5, 200, 20, 5)
-    params["reg_alpha"] = st.sidebar.number_input("reg_alpha", 0.0, 10.0, 0.0, step=0.1)
-    params["reg_lambda"] = st.sidebar.number_input("reg_lambda", 0.0, 10.0, 0.0, step=0.1)
+    params["n_estimators"] = st.sidebar.slider("n_estimators", 500, 12000, 4000, 100)
+    st.sidebar.caption("Early stopping sẽ chọn best iteration, bạn có thể để lớn.")
 
+    params["learning_rate"] = st.sidebar.number_input("learning_rate", 0.005, 0.3, 0.03, step=0.005)
+    st.sidebar.caption("0.01–0.05 thường ổn. Nhỏ hơn → cần nhiều cây hơn.")
+
+    params["max_depth"] = st.sidebar.slider("max_depth (0 = -1)", 0, 30, 0, 1)
+    st.sidebar.caption("0 = không giới hạn. Nếu overfit → thử 6–16.")
+
+    params["num_leaves"] = st.sidebar.slider("num_leaves", 15, 255, 63, 2)
+    st.sidebar.caption("Tăng → mạnh hơn nhưng dễ overfit. Nếu Test thấp → giảm (31–127).")
+
+    params["min_child_samples"] = st.sidebar.slider("min_child_samples", 5, 200, 20, 5)
+    st.sidebar.caption("Tăng → mỗi lá cần nhiều mẫu hơn → giảm overfit (20–80).")
+
+    params["subsample"] = st.sidebar.slider("subsample", 0.5, 1.0, 0.9, 0.05)
+    st.sidebar.caption("Giảm nhẹ (0.7–0.9) giúp chống overfit.")
+
+    params["colsample_bytree"] = st.sidebar.slider("colsample_bytree", 0.5, 1.0, 0.9, 0.05)
+    st.sidebar.caption("Giảm nhẹ (0.7–0.9) giúp generalize tốt hơn.")
+
+    params["reg_alpha"] = st.sidebar.number_input("reg_alpha", 0.0, 10.0, 0.0, step=0.1)
+    st.sidebar.caption("L1. Tăng nhẹ nếu feature nhiễu.")
+
+    params["reg_lambda"] = st.sidebar.number_input("reg_lambda", 0.0, 10.0, 0.0, step=0.1)
+    st.sidebar.caption("L2. Tăng nhẹ để mượt và bớt overfit.")
 
 # =========================
 # MAIN
@@ -344,38 +452,39 @@ with tab1:
 
     st.info(f"Đã lấy intersection features: {len(features)} cột (đã loại 'title' và target).")
 
-
 with tab2:
     st.subheader("Huấn luyện mô hình")
+    muted("Gợi ý: Nếu Train R2 rất cao nhưng Test R2 thấp → mô hình đang overfit. Hãy giảm độ phức tạp (max_depth ↓, min_samples_leaf ↑, subsample/colsample ↓, regularization ↑).")
+
     start_train = st.button("🚀 Bắt đầu huấn luyện", type="primary")
 
     if start_train:
         with st.spinner("Đang huấn luyện..."):
-            model_pipeline, use_es = build_model(model_choice, params)
+            model_pipeline, use_es, use_log_target = build_model(model_choice, params)
             model_pipeline = train_model(
                 model_pipeline,
                 use_es,
+                use_log_target,
                 model_choice,
                 X_tr, y_tr, X_vl, y_vl,
-                early_rounds=(early_rounds if early_rounds is not None else 50)
+                early_rounds=(early_rounds if early_rounds is not None else 100),
             )
 
             st.session_state["trained_model"] = model_pipeline
             st.session_state["features"] = features
+            st.session_state["use_log_target"] = use_log_target
 
-            # predict all
-            y_pred_tr = model_pipeline.predict(X_tr)
-            y_pred_vl = model_pipeline.predict(X_vl)
-            y_pred_ts = model_pipeline.predict(X_ts)
+            # predict all (inverse if needed)
+            y_pred_tr = predict_price(model_pipeline, X_tr, use_log_target)
+            y_pred_vl = predict_price(model_pipeline, X_vl, use_log_target)
+            y_pred_ts = predict_price(model_pipeline, X_ts, use_log_target)
 
-            # metrics table like image
             rows = [
                 calculate_metrics_row("Train", y_tr.values, y_pred_tr),
                 calculate_metrics_row("Validation", y_vl.values, y_pred_vl),
                 calculate_metrics_row("Test", y_ts.values, y_pred_ts),
             ]
             metrics_df = pd.DataFrame(rows)
-
             st.session_state["metrics_df"] = metrics_df
             st.session_state["test_pred"] = y_pred_ts
 
@@ -383,14 +492,24 @@ with tab2:
 
     if "trained_model" in st.session_state:
         st.subheader("Bảng kết quả")
+        muted("R2: độ phù hợp mô hình (gần 1 là tốt).  MAE: sai số tuyệt đối trung bình (VND).  RMSE: phạt sai số lớn mạnh hơn (VND).  MAPE: % sai số trung bình.")
         st.dataframe(st.session_state["metrics_df"], use_container_width=True)
 
-        st.subheader("Feature Importance")
+        st.divider()
+
+        # 3 VISUALS — 3 ROWS (giống yêu cầu)
+        st.subheader("1) Feature Importance")
         top_k = st.slider("Top K", 5, min(50, len(features)), 15, 1)
         plot_feature_importance(st.session_state["trained_model"], features, top_k=top_k)
+
+        st.subheader("2) Residuals Distribution (Sai số)")
+        plot_residuals(y_ts.values, st.session_state["test_pred"])
+
+        st.subheader("3) Actual vs Predicted (Test)")
+        plot_actual_vs_pred(y_ts.values, st.session_state["test_pred"])
+
     else:
         st.info("Bấm **Bắt đầu huấn luyện** để train model.")
-
 
 with tab3:
     st.subheader("Dự đoán")
@@ -400,8 +519,14 @@ with tab3:
         st.markdown("### A) Nhập tay (để test khi deploy/commit)")
         feats = st.session_state["features"]
 
-        # mặc định lấy vài feature đầu (bạn muốn đổi list này cũng được)
-        default_pick = feats[:6] if len(feats) >= 6 else feats
+        # chọn “vài feature chính” (ưu tiên các feature hay quan trọng)
+        priority = [
+            "ram_size", "storage_size", "screen_size", "cpu_cores", "cpu_threads",
+            "gpu_vram", "res_width", "res_height", "battery_wh", "brand_score"
+        ]
+        default_pick = [f for f in priority if f in feats]
+        if len(default_pick) == 0:
+            default_pick = feats[:6] if len(feats) >= 6 else feats
 
         with st.form("manual_form"):
             picked = st.multiselect("Chọn feature muốn nhập", options=feats, default=default_pick)
@@ -420,7 +545,7 @@ with tab3:
                 x[k] = float(v)
 
             X_one = pd.DataFrame([x], columns=feats)
-            pred = float(st.session_state["trained_model"].predict(X_one)[0])
+            pred = float(predict_price(st.session_state["trained_model"], X_one, st.session_state["use_log_target"])[0])
             st.success(f"✅ Giá dự đoán: {pred:,.0f} VND")
 
         st.divider()
@@ -429,7 +554,12 @@ with tab3:
         pred_file = st.file_uploader("Upload CSV", type="csv", key="pred_csv")
         if pred_file:
             try:
-                out_df = predict_from_csv(st.session_state["trained_model"], st.session_state["features"], pred_file)
+                out_df = predict_from_csv(
+                    st.session_state["trained_model"],
+                    st.session_state["features"],
+                    pred_file,
+                    st.session_state["use_log_target"],
+                )
                 st.success("✅ Dự đoán xong!")
                 st.dataframe(out_df.head(20), use_container_width=True)
 
@@ -437,7 +567,6 @@ with tab3:
                 st.download_button("⬇️ Tải file dự đoán", csv_bytes, "predictions.csv", "text/csv")
             except Exception as e:
                 st.error(f"Lỗi dự đoán: {e}")
-
 
 with tab4:
     st.subheader("Xuất file")
@@ -451,6 +580,8 @@ with tab4:
         st.divider()
 
         test_results = df_ts.copy()
-        test_results["predicted_price_base"] = st.session_state.get("test_pred", st.session_state["trained_model"].predict(X_ts))
+        preds = predict_price(st.session_state["trained_model"], X_ts, st.session_state["use_log_target"])
+        test_results["predicted_price_base"] = preds
+
         csv = test_results.to_csv(index=False).encode("utf-8")
         st.download_button("📊 Tải test_predictions.csv", csv, "test_predictions.csv", "text/csv")
